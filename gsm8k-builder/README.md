@@ -1,4 +1,4 @@
-# reliable-gsm8k-builder
+# gsm8k-builder
 
 Small standalone GSM8K dataset builder.
 

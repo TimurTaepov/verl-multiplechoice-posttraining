@@ -38,7 +38,7 @@ if match is None:
 version = tuple(int(part) for part in match.groups())
 if version < (2, 8, 0):
     raise SystemExit(
-        "reliable-gsm8k-builder requires PyTorch >= 2.8.0 for local Transformers backends. "
+        "gsm8k-builder requires PyTorch >= 2.8.0 for local Transformers backends. "
         f"Found torch=={torch.__version__}."
     )
 print(f"torch ok: version={torch.__version__}")

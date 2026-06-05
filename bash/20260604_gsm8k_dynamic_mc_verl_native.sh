@@ -7,7 +7,7 @@ set -euo pipefail
 #   through the dataset hooks, and update the actor with GRPO.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILDER_DIR="$REPO_ROOT/reliable-gsm8k-builder"
+BUILDER_DIR="$REPO_ROOT/gsm8k-builder"
 
 export PYTHONPATH="$BUILDER_DIR/src:$REPO_ROOT:${PYTHONPATH:-}"
 

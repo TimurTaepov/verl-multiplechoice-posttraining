@@ -9,7 +9,7 @@ set -euo pipefail
 #   bash/20260327_gsm8k_mc_sampled.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILDER_DIR="$REPO_ROOT/reliable-gsm8k-builder"
+BUILDER_DIR="$REPO_ROOT/gsm8k-builder"
 
 DATE_TAG=${DATE_TAG:-20260529}
 GPU_IDS=${GPU_IDS:-}

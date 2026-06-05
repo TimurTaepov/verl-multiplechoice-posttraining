@@ -19,7 +19,7 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-BUILDER_SRC = REPO_ROOT / "reliable-gsm8k-builder" / "src"
+BUILDER_SRC = REPO_ROOT / "gsm8k-builder" / "src"
 if str(BUILDER_SRC) not in sys.path:
     sys.path.insert(0, str(BUILDER_SRC))
 

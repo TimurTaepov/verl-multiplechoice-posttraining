@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILDER_SRC = REPO_ROOT / "reliable-gsm8k-builder" / "src"
+BUILDER_SRC = REPO_ROOT / "gsm8k-builder" / "src"
 for path in (REPO_ROOT, BUILDER_SRC):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
