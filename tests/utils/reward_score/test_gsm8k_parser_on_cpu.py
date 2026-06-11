@@ -31,3 +31,15 @@ def test_flexible_parser_falls_back_to_last_number_without_box():
 def test_strict_parser_normalizes_trailing_period():
     assert gsm8k.extract_solution("#### 308.", method="strict") == "308"
     assert gsm8k.compute_score("#### 308.", "308", method="strict") == 1.0
+
+def test_flexible_parser_extracts_final_answer_marker():
+    completion = "REASONING: compute carefully\nFINAL_ANSWER: 15.00"
+    assert gsm8k.extract_solution(completion, method="flexible") == "15.00"
+    assert gsm8k.compute_score(completion, "15", method="flexible") == 1.0
+
+
+def test_strict_parser_does_not_accept_final_answer_marker():
+    completion = "REASONING: compute carefully\nFINAL_ANSWER: 15"
+    assert gsm8k.extract_solution(completion, method="strict") is None
+    assert gsm8k.compute_score(completion, "15", method="strict") == 0
+

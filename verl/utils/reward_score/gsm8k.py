@@ -16,7 +16,8 @@ import re
 from decimal import Decimal, InvalidOperation
 
 _SOLUTION_CLIP_CHARS = 300
-_BOXED_NUMERIC_RE = re.compile(r"\\boxed\{\s*\$?([+-]?(?:\d[\d,]*|\d*\.\d+))\s*\}")
+_BOXED_NUMERIC_RE = re.compile(r"\\boxed\{\s*\$?([+-]?(?:\d*\.\d+|\d[\d,]*))\s*\}")
+_FINAL_ANSWER_NUMERIC_RE = re.compile(r"FINAL_ANSWER:\s*\$?([+-]?(?:\d*\.\d+|\d[\d,]*))", re.IGNORECASE)
 
 
 def _normalize_numeric_token(token):
@@ -34,6 +35,14 @@ def _normalize_numeric_token(token):
 def _extract_boxed_numeric_token(solution_str):
     tail = solution_str[-800:] if len(solution_str) > 800 else solution_str
     matches = _BOXED_NUMERIC_RE.findall(tail)
+    if not matches:
+        return None
+    return _normalize_numeric_token(matches[-1])
+
+
+def _extract_final_answer_numeric_token(solution_str):
+    tail = solution_str[-800:] if len(solution_str) > 800 else solution_str
+    matches = _FINAL_ANSWER_NUMERIC_RE.findall(tail)
     if not matches:
         return None
     return _normalize_numeric_token(matches[-1])
@@ -66,6 +75,9 @@ def extract_solution(solution_str, method="strict"):
             final_answer = _normalize_numeric_token(solutions[-1])
     elif method == "flexible":
         final_answer = _extract_boxed_numeric_token(solution_str)
+        if final_answer is not None:
+            return final_answer
+        final_answer = _extract_final_answer_numeric_token(solution_str)
         if final_answer is not None:
             return final_answer
         if len(solution_str) > _SOLUTION_CLIP_CHARS:
