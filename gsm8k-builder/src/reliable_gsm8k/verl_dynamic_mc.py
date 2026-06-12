@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import random
+from pathlib import Path
 from typing import Any
 
 import datasets
@@ -24,6 +26,37 @@ def _get_int_config(config: Any, key: str, default: int, *, minimum: int) -> int
     if value < minimum:
         raise ValueError(f"data.dynamic_mc.{key} must be >= {minimum}, got {value}.")
     return value
+
+
+def _get_bool_config(config: Any, key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, set):
+        return sorted(value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def question_id_from_question(question: str) -> str:
@@ -201,13 +234,96 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         if self.stage2_insert_strategy not in {"prepend", "append"}:
             raise ValueError("data.dynamic_mc.stage2_insert_strategy must be 'prepend' or 'append'.")
         self.seed = int(dynamic_cfg.get("seed", self.config.get("seed", 7) or 7))
+        artifact_dir_raw = str(dynamic_cfg.get("artifact_dir", "")).strip()
+        self.artifact_dir = Path(artifact_dir_raw).expanduser() if artifact_dir_raw else None
+        self.artifact_include_completions = _get_bool_config(dynamic_cfg, "artifact_include_completions", True)
+        if self.artifact_dir is not None:
+            self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self._candidate_buffer: dict[str, dict[str, Any]] = {}
         self._stage2_counts: dict[str, int] = {}
         self._hook_calls = 0
+        self._stage1_seen_total = 0
+        self._stage1_rejected_total = 0
         self._accepted_correct_total = 0
         self._accepted_incorrect_total = 0
+        self._stage2_queued_total = 0
         self._inserted_stage2_total = 0
+        self._stage2_question_ids: set[str] = set()
+        self._initial_question_count = self._count_initial_questions()
         self._pending_stage2_records: list[dict[str, Any]] = []
+        self._write_summary()
+
+    def _count_initial_questions(self) -> int:
+        try:
+            return len({str(qid) for qid in self.dataframe["question_id"] if str(qid)})
+        except Exception:
+            question_ids: set[str] = set()
+            for record in self.dataframe:
+                question_id = str(record.get("question_id", ""))
+                if question_id:
+                    question_ids.add(question_id)
+            return len(question_ids)
+
+    def _artifact_path(self, name: str) -> Path | None:
+        if self.artifact_dir is None:
+            return None
+        return self.artifact_dir / name
+
+    def _append_artifact(self, name: str, payload: dict[str, Any]) -> None:
+        path = self._artifact_path(name)
+        if path is None:
+            return
+        _append_jsonl(path, payload)
+
+    def _summary_payload(self) -> dict[str, Any]:
+        questions_with_correct = sum(1 for entry in self._candidate_buffer.values() if entry["correct"])
+        questions_with_incorrect = sum(1 for entry in self._candidate_buffer.values() if entry["incorrect"])
+        successful_questions = len(self._stage2_question_ids)
+        return {
+            "initial_question_count": self._initial_question_count,
+            "hook_calls": self._hook_calls,
+            "stage1_seen_total": self._stage1_seen_total,
+            "stage1_rejected_total": self._stage1_rejected_total,
+            "stage1_accepted_correct_total": self._accepted_correct_total,
+            "stage1_accepted_incorrect_total": self._accepted_incorrect_total,
+            "stage1_accepted_total": self._accepted_correct_total + self._accepted_incorrect_total,
+            "questions_with_correct_candidate": questions_with_correct,
+            "questions_with_incorrect_candidate": questions_with_incorrect,
+            "candidate_buffer_question_count": len(self._candidate_buffer),
+            "stage2_queued_total": self._stage2_queued_total,
+            "stage2_inserted_total": self._inserted_stage2_total,
+            "stage2_pending_total": len(self._pending_stage2_records),
+            "successful_stage2_question_count": successful_questions,
+            "successful_stage2_question_coverage": (
+                successful_questions / self._initial_question_count if self._initial_question_count else 0.0
+            ),
+        }
+
+    def _write_summary(self) -> None:
+        path = self._artifact_path("dynamic_mc_summary.json")
+        if path is None:
+            return
+        _write_json(path, self._summary_payload())
+
+    def _metrics_snapshot(self, **batch_values: int | float) -> dict[str, int | float]:
+        payload = self._summary_payload()
+        metrics: dict[str, int | float] = {
+            "dynamic_mc/initial_question_count": payload["initial_question_count"],
+            "dynamic_mc/stage1_seen_total": payload["stage1_seen_total"],
+            "dynamic_mc/stage1_rejected_total": payload["stage1_rejected_total"],
+            "dynamic_mc/stage1_accepted_correct_total": payload["stage1_accepted_correct_total"],
+            "dynamic_mc/stage1_accepted_incorrect_total": payload["stage1_accepted_incorrect_total"],
+            "dynamic_mc/stage1_accepted_total": payload["stage1_accepted_total"],
+            "dynamic_mc/questions_with_correct_candidate": payload["questions_with_correct_candidate"],
+            "dynamic_mc/questions_with_incorrect_candidate": payload["questions_with_incorrect_candidate"],
+            "dynamic_mc/stage2_queued_total": payload["stage2_queued_total"],
+            "dynamic_mc/stage2_inserted_total": payload["stage2_inserted_total"],
+            "dynamic_mc/stage2_pending_total": payload["stage2_pending_total"],
+            "dynamic_mc/successful_stage2_question_count": payload["successful_stage2_question_count"],
+            "dynamic_mc/successful_stage2_question_coverage": payload["successful_stage2_question_coverage"],
+        }
+        metrics.update({f"dynamic_mc/{key}": value for key, value in batch_values.items()})
+        return metrics
 
     def _decode_responses(self, batch: DataProto) -> list[str]:
         prompt_len = batch.batch["prompts"].shape[-1]
@@ -357,15 +473,33 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         if not records:
             return
         self._pending_stage2_records.extend(records)
+        self._stage2_queued_total += len(records)
+        for record in records:
+            question_id = str(record.get("question_id", ""))
+            if question_id:
+                self._stage2_question_ids.add(question_id)
+            self._append_artifact(
+                "stage2_prompts.jsonl",
+                {
+                    "event": "stage2_prompt_queued",
+                    "hook": self._hook_calls,
+                    "question_id": question_id,
+                    "reward_model": record.get("reward_model", {}),
+                    "extra_info": record.get("extra_info", {}),
+                    "prompt": record.get("prompt", []),
+                },
+            )
+        self._write_summary()
         print(
             "[GSM8KDynamicMCDataset] "
-            f"queued_stage2={len(records)} pending_stage2={len(self._pending_stage2_records)}"
+            f"queued_stage2={len(records)} pending_stage2={len(self._pending_stage2_records)} "
+            f"successful_stage2_questions={len(self._stage2_question_ids)}"
         )
 
     def has_pending_dynamic_rows(self) -> bool:
         return bool(self._pending_stage2_records)
 
-    def _flush_pending_stage2_records(self) -> int:
+    def _flush_pending_stage2_records(self, *, epoch: int | None = None) -> int:
         if not self._pending_stage2_records:
             return 0
         records = self._pending_stage2_records
@@ -373,33 +507,47 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         dataframe = datasets.Dataset.from_list(records)
         dataframe = self.maybe_filter_out_long_prompts(dataframe)
         if len(dataframe) == 0:
+            self._write_summary()
             return 0
         if self.stage2_insert_strategy == "prepend":
             self.dataframe = datasets.concatenate_datasets([dataframe, self.dataframe])
         else:
             self.dataframe = datasets.concatenate_datasets([self.dataframe, dataframe])
-        self._inserted_stage2_total += len(dataframe)
+        inserted_count = len(dataframe)
+        self._inserted_stage2_total += inserted_count
+        self._append_artifact(
+            "stage2_insertions.jsonl",
+            {
+                "event": "stage2_rows_inserted",
+                "epoch": epoch,
+                "inserted_stage2": inserted_count,
+                "inserted_stage2_total": self._inserted_stage2_total,
+                "dataset_len": len(self.dataframe),
+            },
+        )
+        self._write_summary()
         print(
             "[GSM8KDynamicMCDataset] "
-            f"inserted_stage2={len(dataframe)} strategy={self.stage2_insert_strategy} "
+            f"inserted_stage2={inserted_count} strategy={self.stage2_insert_strategy} "
             f"inserted_stage2_total={self._inserted_stage2_total} dataset_len={len(self.dataframe)}"
         )
-        return len(dataframe)
+        return inserted_count
 
     def on_epoch_end(self, epoch: int) -> int:
         print(
             "[GSM8KDynamicMCDataset] "
             f"epoch_end={epoch} pending_stage2={len(self._pending_stage2_records)}"
         )
-        return self._flush_pending_stage2_records()
+        return self._flush_pending_stage2_records(epoch=epoch)
 
-    def on_batch_end(self, batch: DataProto) -> None:
+    def on_batch_end(self, batch: DataProto) -> dict[str, int | float]:
         self._hook_calls += 1
         responses = self._decode_responses(batch)
         new_records: list[dict[str, Any]] = []
         stage1_seen = 0
         accepted_correct = 0
         accepted_incorrect = 0
+        rejected = 0
         for index, response in enumerate(responses):
             extra_info = batch[index].non_tensor_batch.get("extra_info", {})
             if not isinstance(extra_info, dict) or extra_info.get("stage") != "stage1_candidate":
@@ -410,12 +558,27 @@ class GSM8KDynamicMCDataset(RLHFDataset):
                 continue
             candidate = self._candidate_from_response(response=response, extra_info=extra_info)
             if candidate is None:
+                rejected += 1
                 continue
             if candidate.role == "correct":
                 accepted_correct += 1
             else:
                 accepted_incorrect += 1
             self._record_candidate(question_id=question_id, extra_info=extra_info, candidate=candidate)
+            artifact_payload = {
+                "event": "stage1_candidate_accepted",
+                "hook": self._hook_calls,
+                "question_id": question_id,
+                "item_id": str(extra_info.get("item_id", "")),
+                "candidate_slot": extra_info.get("candidate_slot"),
+                "role_requested": str(extra_info.get("role_requested", "")),
+                "role": candidate.role,
+                "final_answer": candidate.final_answer,
+                "gold_answer": str(extra_info.get("gold_answer", "")),
+            }
+            if self.artifact_include_completions:
+                artifact_payload["completion"] = candidate.completion
+            self._append_artifact("stage1_candidates.jsonl", artifact_payload)
             if len(new_records) < self.max_new_stage2_per_batch:
                 entry = self._candidate_buffer[question_id]
                 incorrect_end = int(entry.get("incorrect_cursor", 0)) + self.incorrect_target_count
@@ -425,17 +588,27 @@ class GSM8KDynamicMCDataset(RLHFDataset):
             if stage2 is not None and self._stage2_record_passes_prompt_filter(stage2):
                 self._commit_stage2_candidate_set(question_id=question_id, entry=entry, incorrect_end=incorrect_end)
                 new_records.append(stage2)
+        self._stage1_seen_total += stage1_seen
+        self._stage1_rejected_total += rejected
         self._accepted_correct_total += accepted_correct
         self._accepted_incorrect_total += accepted_incorrect
         print(
             "[GSM8KDynamicMCDataset] "
             f"hook={self._hook_calls} stage1_seen={stage1_seen} "
-            f"accepted_correct={accepted_correct} accepted_incorrect={accepted_incorrect} "
+            f"accepted_correct={accepted_correct} accepted_incorrect={accepted_incorrect} rejected={rejected} "
             f"accepted_correct_total={self._accepted_correct_total} "
             f"accepted_incorrect_total={self._accepted_incorrect_total} "
             f"stage2_ready={len(new_records)}"
         )
         self._queue_stage2_records(new_records)
+        self._write_summary()
+        return self._metrics_snapshot(
+            stage1_seen_batch=stage1_seen,
+            stage1_rejected_batch=rejected,
+            stage1_accepted_correct_batch=accepted_correct,
+            stage1_accepted_incorrect_batch=accepted_incorrect,
+            stage2_ready_batch=len(new_records),
+        )
 
 
 def compute_score(

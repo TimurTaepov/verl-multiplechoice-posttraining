@@ -1550,6 +1550,15 @@ class RayPPOTrainer:
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
+                # this is experimental and may be changed/removed in the future
+                # in favor of a general-purpose data buffer pool
+                if hasattr(self.train_dataset, "on_batch_end"):
+                    # Dynamic datasets should only queue here; materialize rows
+                    # at epoch boundaries to avoid mutating active sampler indices.
+                    dynamic_metrics = self.train_dataset.on_batch_end(batch=batch)
+                    if dynamic_metrics:
+                        metrics.update(dynamic_metrics)
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
@@ -1563,13 +1572,6 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.dump_memory_snapshot(
                         tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
                     )
-
-                # this is experimental and may be changed/removed in the future
-                # in favor of a general-purpose data buffer pool
-                if hasattr(self.train_dataset, "on_batch_end"):
-                    # Dynamic datasets should only queue here; materialize rows
-                    # at epoch boundaries to avoid mutating active sampler indices.
-                    self.train_dataset.on_batch_end(batch=batch)
 
                 if (
                     is_last_step

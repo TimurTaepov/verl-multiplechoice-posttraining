@@ -15,20 +15,31 @@ DATE_TAG=${DATE_TAG:-20260604}
 RUN_ID=${RUN_ID:-${DATE_TAG}_gsm8k_dynamic_mc_verl_native_grpo}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-3B-Instruct}
 SPLIT=${SPLIT:-train}
+TRAIN_PARTITION=${TRAIN_PARTITION:-train}
 NUM_SAMPLES=${NUM_SAMPLES:-1000}
 GPU_IDS=${GPU_IDS:-}
 
 OUTPUT_ROOT=${OUTPUT_ROOT:-$BUILDER_DIR/runs_verl_native_dynamic_mc}
 SEED_DIR=${SEED_DIR:-$OUTPUT_ROOT/seed}
-SEED_FILE=${SEED_FILE:-$SEED_DIR/${RUN_ID}_${SPLIT}_stage1.parquet}
+SEED_FILE=${SEED_FILE:-$SEED_DIR/${RUN_ID}_${SPLIT}_${TRAIN_PARTITION}_stage1.parquet}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-$REPO_ROOT/checkpoints/dynamic_mc/$RUN_ID}
+ARTIFACT_DIR=${ARTIFACT_DIR:-$OUTPUT_ROOT/artifacts/$RUN_ID}
+WANDB_ARTIFACTS=${WANDB_ARTIFACTS:-auto}
+WANDB_ARTIFACT_NAME=${WANDB_ARTIFACT_NAME:-${RUN_ID}_dynamic_mc_training_data}
+WANDB_UPLOAD_CHECKPOINTS=${WANDB_UPLOAD_CHECKPOINTS:-0}
+ARTIFACT_INCLUDE_COMPLETIONS=${ARTIFACT_INCLUDE_COMPLETIONS:-1}
 if [[ -n "${VAL_FILE:-}" ]]; then
   VAL_FILE_PROVIDED=1
 else
   VAL_FILE_PROVIDED=0
 fi
-VAL_FILE=${VAL_FILE:-$SEED_DIR/${RUN_ID}_test_stage1.parquet}
+VAL_SOURCE_SPLIT=${VAL_SOURCE_SPLIT:-train}
+VAL_PARTITION=${VAL_PARTITION:-val}
+VAL_FILE=${VAL_FILE:-$SEED_DIR/${RUN_ID}_${VAL_PARTITION}_stage1.parquet}
 VAL_NUM_SAMPLES=${VAL_NUM_SAMPLES:-128}
+VAL_HOLDOUT_SIZE=${VAL_HOLDOUT_SIZE:-512}
+VAL_HOLDOUT_RATIO=${VAL_HOLDOUT_RATIO:-}
+DATA_SPLIT_SEED=${DATA_SPLIT_SEED:-7}
 if [[ -z "${VAL_STAGE1_PROMPT_COUNT:-}" ]]; then
   if [[ -n "${VAL_INCORRECT_TARGET_COUNT:-}" ]]; then
     VAL_STAGE1_PROMPT_COUNT=$((VAL_INCORRECT_TARGET_COUNT + 1))
@@ -54,21 +65,33 @@ MAX_STAGE2_PER_QUESTION=${MAX_STAGE2_PER_QUESTION:-4}
 MAX_NEW_STAGE2_PER_BATCH=${MAX_NEW_STAGE2_PER_BATCH:-256}
 STAGE2_CANDIDATE_MAX_CHARS=${STAGE2_CANDIDATE_MAX_CHARS:-2000}
 
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
-GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-128}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-128}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-32}
+GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-32}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}
 ACTOR_MICRO_BATCH_SIZE=${ACTOR_MICRO_BATCH_SIZE:-8}
-ROLLOUT_N=${ROLLOUT_N:-4}
+ROLLOUT_N=${ROLLOUT_N:-8}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-3}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-}
-LEARNING_RATE=${LEARNING_RATE:-1e-6}
+LEARNING_RATE=${LEARNING_RATE:-1e-5}
 SAVE_FREQ=${SAVE_FREQ:-100}
 TEST_FREQ=${TEST_FREQ:-10}
 PROJECT_NAME=${PROJECT_NAME:-multiple_choice_question_study}
-TRAINER_LOGGER=${TRAINER_LOGGER:-'["console"]'}
+TRAINER_LOGGER=${TRAINER_LOGGER:-'["console","wandb"]'}
 
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-4096}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
+ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
+VAL_ROLLOUT_N=${VAL_ROLLOUT_N:-16}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.6}
+VAL_TOP_P=${VAL_TOP_P:-0.95}
+VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
+KL_COEF=${KL_COEF:-0.0}
+CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH:-0.28}
+ROLLOUT_IS=${ROLLOUT_IS:-token}
+ROLLOUT_IS_THRESHOLD=${ROLLOUT_IS_THRESHOLD:-2.0}
+LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-10}
+WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
+GRAD_CLIP=${GRAD_CLIP:-1.0}
 
 DRY_RUN=${DRY_RUN:-0}
 
@@ -119,7 +142,7 @@ if ! [[ "$TOTAL_EPOCHS" =~ ^[0-9]+$ ]] || [[ "$TOTAL_EPOCHS" -lt 2 ]]; then
   exit 1
 fi
 
-mkdir -p "$SEED_DIR" "$CHECKPOINT_DIR" "$LOG_DIR"
+mkdir -p "$SEED_DIR" "$CHECKPOINT_DIR" "$LOG_DIR" "$ARTIFACT_DIR"
 
 if [[ "$DRY_RUN" != "1" ]]; then
   exec > >(tee "$LOG_FILE") 2>&1
@@ -129,33 +152,55 @@ if [[ -n "$GPU_IDS" ]]; then
   export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 fi
 
+if [[ "$TRAINER_LOGGER" == *wandb* ]]; then
+  export WANDB_RUN_ID="${WANDB_RUN_ID:-$RUN_ID}"
+  export WANDB_RESUME="${WANDB_RESUME:-allow}"
+fi
+
 echo "[dynamic-mc-verl-native] run_id=$RUN_ID"
 echo "[dynamic-mc-verl-native] model_path=$MODEL_PATH"
+echo "[dynamic-mc-verl-native] train_split=$SPLIT train_partition=$TRAIN_PARTITION"
+echo "[dynamic-mc-verl-native] val_split=$VAL_SOURCE_SPLIT val_partition=$VAL_PARTITION holdout_size=$VAL_HOLDOUT_SIZE split_seed=$DATA_SPLIT_SEED"
 echo "[dynamic-mc-verl-native] seed_file=$SEED_FILE"
 echo "[dynamic-mc-verl-native] val_file=$VAL_FILE"
 echo "[dynamic-mc-verl-native] checkpoint_dir=$CHECKPOINT_DIR"
+echo "[dynamic-mc-verl-native] artifact_dir=$ARTIFACT_DIR"
+echo "[dynamic-mc-verl-native] trainer_logger=$TRAINER_LOGGER wandb_artifacts=$WANDB_ARTIFACTS"
 echo "[dynamic-mc-verl-native] stage1_prompt_count=$STAGE1_PROMPT_COUNT rollout_n=$ROLLOUT_N stage1_attempts_per_question=$((STAGE1_PROMPT_COUNT * ROLLOUT_N)) initial_stage1_rows=$INITIAL_STAGE1_ROWS"
 echo "[dynamic-mc-verl-native] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>}"
 
 CREATE_SEED_CMD=(
   python "$BUILDER_DIR/create_dynamic_mc_seed.py"
   --split "$SPLIT"
+  --partition "$TRAIN_PARTITION"
+  --validation-size "$VAL_HOLDOUT_SIZE"
+  --split-seed "$DATA_SPLIT_SEED"
   --num-samples "$NUM_SAMPLES"
   --stage1-prompt-count "$STAGE1_PROMPT_COUNT"
   --prompt-mode "$STAGE1_PROMPT_MODE"
   --output "$SEED_FILE"
 )
 
+if [[ -n "$VAL_HOLDOUT_RATIO" ]]; then
+  CREATE_SEED_CMD+=(--validation-ratio "$VAL_HOLDOUT_RATIO")
+fi
+
 CREATE_VAL_CMD=()
 if [[ "$VAL_FILE_PROVIDED" == "0" ]]; then
   CREATE_VAL_CMD=(
     python "$BUILDER_DIR/create_dynamic_mc_seed.py"
-    --split test
+    --split "$VAL_SOURCE_SPLIT"
+    --partition "$VAL_PARTITION"
+    --validation-size "$VAL_HOLDOUT_SIZE"
+    --split-seed "$DATA_SPLIT_SEED"
     --num-samples "$VAL_NUM_SAMPLES"
     --stage1-prompt-count "$VAL_STAGE1_PROMPT_COUNT"
     --prompt-mode "$STAGE1_PROMPT_MODE"
     --output "$VAL_FILE"
   )
+  if [[ -n "$VAL_HOLDOUT_RATIO" ]]; then
+    CREATE_VAL_CMD+=(--validation-ratio "$VAL_HOLDOUT_RATIO")
+  fi
 fi
 
 VERL_CMD=(
@@ -180,16 +225,30 @@ VERL_CMD=(
   +data.dynamic_mc.max_new_stage2_per_batch="$MAX_NEW_STAGE2_PER_BATCH"
   +data.dynamic_mc.stage2_candidate_max_chars="$STAGE2_CANDIDATE_MAX_CHARS"
   +data.dynamic_mc.stage2_insert_strategy=prepend
+  +data.dynamic_mc.artifact_dir="$ARTIFACT_DIR"
+  +data.dynamic_mc.artifact_include_completions="$ARTIFACT_INCLUDE_COMPLETIONS"
   actor_rollout_ref.model.path="$MODEL_PATH"
   actor_rollout_ref.actor.optim.lr="$LEARNING_RATE"
+  actor_rollout_ref.actor.optim.lr_warmup_steps="$LR_WARMUP_STEPS"
+  actor_rollout_ref.actor.optim.weight_decay="$WEIGHT_DECAY"
+  actor_rollout_ref.actor.optim.clip_grad="$GRAD_CLIP"
   actor_rollout_ref.actor.ppo_mini_batch_size="$PPO_MINI_BATCH_SIZE"
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="$ACTOR_MICRO_BATCH_SIZE"
+  actor_rollout_ref.actor.clip_ratio_high="$CLIP_RATIO_HIGH"
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.n="$ROLLOUT_N"
+  actor_rollout_ref.rollout.temperature="$ROLLOUT_TEMPERATURE"
+  actor_rollout_ref.rollout.val_kwargs.n="$VAL_ROLLOUT_N"
+  actor_rollout_ref.rollout.val_kwargs.temperature="$VAL_TEMPERATURE"
+  actor_rollout_ref.rollout.val_kwargs.top_p="$VAL_TOP_P"
+  actor_rollout_ref.rollout.val_kwargs.do_sample="$VAL_DO_SAMPLE"
+  actor_rollout_ref.rollout.calculate_log_probs=True
   actor_rollout_ref.rollout.tensor_model_parallel_size=1
   actor_rollout_ref.rollout.gpu_memory_utilization=0.4
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=20
-  algorithm.kl_ctrl.kl_coef=0.001
+  algorithm.kl_ctrl.kl_coef="$KL_COEF"
+  algorithm.rollout_correction.rollout_is="$ROLLOUT_IS"
+  algorithm.rollout_correction.rollout_is_threshold="$ROLLOUT_IS_THRESHOLD"
   trainer.val_before_train=False
   trainer.n_gpus_per_node="${GPUS:-1}"
   trainer.nnodes=1
@@ -229,3 +288,30 @@ if [[ "${#CREATE_VAL_CMD[@]}" -gt 0 ]]; then
   "${CREATE_VAL_CMD[@]}"
 fi
 PYTHONUNBUFFERED=1 VLLM_USE_FLASHINFER_SAMPLER=1 "${VERL_CMD[@]}"
+
+SHOULD_UPLOAD_WANDB_ARTIFACTS=0
+if [[ "$WANDB_ARTIFACTS" == "1" ]]; then
+  SHOULD_UPLOAD_WANDB_ARTIFACTS=1
+elif [[ "$WANDB_ARTIFACTS" == "auto" && "$TRAINER_LOGGER" == *wandb* ]]; then
+  SHOULD_UPLOAD_WANDB_ARTIFACTS=1
+fi
+
+if [[ "$SHOULD_UPLOAD_WANDB_ARTIFACTS" == "1" ]]; then
+  UPLOAD_ARTIFACT_CMD=(
+    python "$BUILDER_DIR/upload_dynamic_mc_artifacts.py"
+    --artifact-dir "$ARTIFACT_DIR"
+    --project "$PROJECT_NAME"
+    --run-id "${WANDB_RUN_ID:-$RUN_ID}"
+    --run-name "$RUN_ID"
+    --artifact-name "$WANDB_ARTIFACT_NAME"
+    --seed-file "$SEED_FILE"
+    --val-file "$VAL_FILE"
+    --log-file "$LOG_FILE"
+    --checkpoint-dir "$CHECKPOINT_DIR"
+  )
+  if [[ "$WANDB_UPLOAD_CHECKPOINTS" == "1" ]]; then
+    UPLOAD_ARTIFACT_CMD+=(--include-checkpoints)
+  fi
+  echo "[dynamic-mc-verl-native] ${UPLOAD_ARTIFACT_CMD[*]}"
+  "${UPLOAD_ARTIFACT_CMD[@]}"
+fi
