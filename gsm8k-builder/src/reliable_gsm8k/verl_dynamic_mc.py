@@ -244,6 +244,7 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         self._hook_calls = 0
         self._stage1_seen_total = 0
         self._stage1_rejected_total = 0
+        self._stage1_duplicate_total = 0
         self._accepted_correct_total = 0
         self._accepted_incorrect_total = 0
         self._stage2_queued_total = 0
@@ -284,6 +285,7 @@ class GSM8KDynamicMCDataset(RLHFDataset):
             "hook_calls": self._hook_calls,
             "stage1_seen_total": self._stage1_seen_total,
             "stage1_rejected_total": self._stage1_rejected_total,
+            "stage1_duplicate_total": self._stage1_duplicate_total,
             "stage1_accepted_correct_total": self._accepted_correct_total,
             "stage1_accepted_incorrect_total": self._accepted_incorrect_total,
             "stage1_accepted_total": self._accepted_correct_total + self._accepted_incorrect_total,
@@ -311,6 +313,7 @@ class GSM8KDynamicMCDataset(RLHFDataset):
             "dynamic_mc/initial_question_count": payload["initial_question_count"],
             "dynamic_mc/stage1_seen_total": payload["stage1_seen_total"],
             "dynamic_mc/stage1_rejected_total": payload["stage1_rejected_total"],
+            "dynamic_mc/stage1_duplicate_total": payload["stage1_duplicate_total"],
             "dynamic_mc/stage1_accepted_correct_total": payload["stage1_accepted_correct_total"],
             "dynamic_mc/stage1_accepted_incorrect_total": payload["stage1_accepted_incorrect_total"],
             "dynamic_mc/stage1_accepted_total": payload["stage1_accepted_total"],
@@ -361,7 +364,7 @@ class GSM8KDynamicMCDataset(RLHFDataset):
             role=role,
         )
 
-    def _record_candidate(self, *, question_id: str, extra_info: dict[str, Any], candidate: VerifiedCandidate) -> None:
+    def _record_candidate(self, *, question_id: str, extra_info: dict[str, Any], candidate: VerifiedCandidate) -> bool:
         entry = self._candidate_buffer.setdefault(
             question_id,
             {
@@ -378,14 +381,15 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         )
         if candidate.role == "correct":
             if candidate.completion in entry["seen_correct_completions"]:
-                return
+                return False
             entry["seen_correct_completions"].add(candidate.completion)
             entry["correct"].append(candidate)
-            return
+            return True
         if candidate.final_answer in entry["seen_incorrect_answers"]:
-            return
+            return False
         entry["seen_incorrect_answers"].add(candidate.final_answer)
         entry["incorrect"].append(candidate)
+        return True
 
     def _format_stage2_option_completion(self, completion: str) -> str:
         completion = completion.strip()
@@ -548,6 +552,7 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         accepted_correct = 0
         accepted_incorrect = 0
         rejected = 0
+        duplicate = 0
         for index, response in enumerate(responses):
             extra_info = batch[index].non_tensor_batch.get("extra_info", {})
             if not isinstance(extra_info, dict) or extra_info.get("stage") != "stage1_candidate":
@@ -560,11 +565,14 @@ class GSM8KDynamicMCDataset(RLHFDataset):
             if candidate is None:
                 rejected += 1
                 continue
+            added = self._record_candidate(question_id=question_id, extra_info=extra_info, candidate=candidate)
+            if not added:
+                duplicate += 1
+                continue
             if candidate.role == "correct":
                 accepted_correct += 1
             else:
                 accepted_incorrect += 1
-            self._record_candidate(question_id=question_id, extra_info=extra_info, candidate=candidate)
             artifact_payload = {
                 "event": "stage1_candidate_accepted",
                 "hook": self._hook_calls,
@@ -590,12 +598,13 @@ class GSM8KDynamicMCDataset(RLHFDataset):
                 new_records.append(stage2)
         self._stage1_seen_total += stage1_seen
         self._stage1_rejected_total += rejected
+        self._stage1_duplicate_total += duplicate
         self._accepted_correct_total += accepted_correct
         self._accepted_incorrect_total += accepted_incorrect
         print(
             "[GSM8KDynamicMCDataset] "
             f"hook={self._hook_calls} stage1_seen={stage1_seen} "
-            f"accepted_correct={accepted_correct} accepted_incorrect={accepted_incorrect} rejected={rejected} "
+            f"accepted_correct={accepted_correct} accepted_incorrect={accepted_incorrect} rejected={rejected} duplicate={duplicate} "
             f"accepted_correct_total={self._accepted_correct_total} "
             f"accepted_incorrect_total={self._accepted_incorrect_total} "
             f"stage2_ready={len(new_records)}"
@@ -605,6 +614,7 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         return self._metrics_snapshot(
             stage1_seen_batch=stage1_seen,
             stage1_rejected_batch=rejected,
+            stage1_duplicate_batch=duplicate,
             stage1_accepted_correct_batch=accepted_correct,
             stage1_accepted_incorrect_batch=accepted_incorrect,
             stage2_ready_batch=len(new_records),
