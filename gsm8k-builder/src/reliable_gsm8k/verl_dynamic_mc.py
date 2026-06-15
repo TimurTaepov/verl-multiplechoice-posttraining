@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import random
 from pathlib import Path
@@ -237,6 +238,8 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         artifact_dir_raw = str(dynamic_cfg.get("artifact_dir", "")).strip()
         self.artifact_dir = Path(artifact_dir_raw).expanduser() if artifact_dir_raw else None
         self.artifact_include_completions = _get_bool_config(dynamic_cfg, "artifact_include_completions", True)
+        self.coverage_chart_interval = _get_int_config(dynamic_cfg, "coverage_chart_interval", 100, minimum=0)
+        self.coverage_chart_on_epoch = _get_bool_config(dynamic_cfg, "coverage_chart_on_epoch", True)
         if self.artifact_dir is not None:
             self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self._candidate_buffer: dict[str, dict[str, Any]] = {}
@@ -252,7 +255,9 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         self._stage2_question_ids: set[str] = set()
         self._initial_question_count = self._count_initial_questions()
         self._pending_stage2_records: list[dict[str, Any]] = []
+        self._coverage_history: list[dict[str, Any]] = []
         self._write_summary()
+        self._record_coverage_history(event="init")
 
     def _count_initial_questions(self) -> int:
         try:
@@ -306,6 +311,114 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         if path is None:
             return
         _write_json(path, self._summary_payload())
+
+    def _coverage_payload(self, *, event: str, epoch: int | None = None) -> dict[str, Any]:
+        payload = self._summary_payload()
+        return {
+            "event": event,
+            "step": self._hook_calls,
+            "epoch": epoch,
+            "coverage": payload["successful_stage2_question_coverage"],
+            "successful_stage2_question_count": payload["successful_stage2_question_count"],
+            "initial_question_count": payload["initial_question_count"],
+            "stage2_queued_total": payload["stage2_queued_total"],
+            "stage2_inserted_total": payload["stage2_inserted_total"],
+            "stage2_pending_total": payload["stage2_pending_total"],
+            "stage1_seen_total": payload["stage1_seen_total"],
+            "stage1_accepted_correct_total": payload["stage1_accepted_correct_total"],
+            "stage1_accepted_incorrect_total": payload["stage1_accepted_incorrect_total"],
+        }
+
+    def _record_coverage_history(self, *, event: str, epoch: int | None = None) -> dict[str, Any]:
+        payload = self._coverage_payload(event=event, epoch=epoch)
+        self._coverage_history.append(payload)
+        self._append_artifact("coverage_history.jsonl", payload)
+        return payload
+
+    def _write_coverage_chart(self, *, reason: str, epoch: int | None = None) -> None:
+        if self.artifact_dir is None or not self._coverage_history:
+            return
+
+        width = 980
+        height = 560
+        left = 90
+        right = 40
+        top = 80
+        bottom = 85
+        chart_w = width - left - right
+        chart_h = height - top - bottom
+        max_step = max(1, max(int(point["step"]) for point in self._coverage_history))
+
+        def x_for(step: int) -> float:
+            return left + (step / max_step) * chart_w
+
+        def y_for(coverage: float) -> float:
+            return top + (1.0 - max(0.0, min(1.0, coverage))) * chart_h
+
+        points = [
+            f'{x_for(int(point["step"])):.2f},{y_for(float(point["coverage"])):.2f}'
+            for point in self._coverage_history
+        ]
+        latest = self._coverage_history[-1]
+        latest_pct = float(latest["coverage"]) * 100.0
+        latest_count = int(latest["successful_stage2_question_count"])
+        total_count = int(latest["initial_question_count"])
+
+        grid_lines = []
+        for pct in (0, 25, 50, 75, 100):
+            y = y_for(pct / 100.0)
+            grid_lines.append(
+                f'<line x1="{left}" y1="{y:.2f}" x2="{width - right}" y2="{y:.2f}" '
+                'stroke="#E5E7EB" stroke-width="1" />'
+            )
+            grid_lines.append(
+                f'<text x="{left - 14}" y="{y + 4:.2f}" text-anchor="end" '
+                'font-family="Arial" font-size="12" fill="#4B5563">'
+                f'{pct}%</text>'
+            )
+
+        event_markers = []
+        for point in self._coverage_history:
+            if str(point.get("event")) == "epoch_end":
+                x = x_for(int(point["step"]))
+                event_markers.append(
+                    f'<line x1="{x:.2f}" y1="{top}" x2="{x:.2f}" y2="{height - bottom}" '
+                    'stroke="#F59E0B" stroke-width="1.5" stroke-dasharray="6 5" />'
+                )
+
+        title = "Dynamic MC Stage 2 Coverage"
+        subtitle = (
+            f'latest: {latest_pct:.2f}% ({latest_count}/{total_count} questions), '
+            f'step={latest["step"]}, reason={reason}'
+        )
+        if epoch is not None:
+            subtitle += f', epoch={epoch}'
+
+        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <rect width="100%" height="100%" fill="#FFFFFF" />
+  <text x="{left}" y="35" font-family="Arial" font-size="24" font-weight="700" fill="#111827">{html.escape(title)}</text>
+  <text x="{left}" y="60" font-family="Arial" font-size="13" fill="#374151">{html.escape(subtitle)}</text>
+  {''.join(grid_lines)}
+  {''.join(event_markers)}
+  <line x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#111827" stroke-width="1.5" />
+  <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#111827" stroke-width="1.5" />
+  <polyline points="{' '.join(points)}" fill="none" stroke="#2563EB" stroke-width="3" />
+  <circle cx="{x_for(int(latest['step'])):.2f}" cy="{y_for(float(latest['coverage'])):.2f}" r="5" fill="#2563EB" />
+  <text x="{left + chart_w / 2:.2f}" y="{height - 35}" text-anchor="middle" font-family="Arial" font-size="13" fill="#111827">training step / dataset hook call</text>
+  <text x="24" y="{top + chart_h / 2:.2f}" text-anchor="middle" font-family="Arial" font-size="13" fill="#111827" transform="rotate(-90 24 {top + chart_h / 2:.2f})">successful Stage 2 question coverage</text>
+  <text x="{left}" y="{height - 15}" font-family="Arial" font-size="12" fill="#6B7280">orange dashed lines mark epoch-end chart writes</text>
+</svg>
+'''
+        latest_path = self.artifact_dir / "coverage_chart.svg"
+        latest_path.write_text(svg, encoding="utf-8")
+
+        chart_dir = self.artifact_dir / "coverage_charts"
+        chart_dir.mkdir(parents=True, exist_ok=True)
+        safe_reason = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in reason).strip("_")
+        if not safe_reason:
+            safe_reason = "chart"
+        snapshot_path = chart_dir / f"coverage_{safe_reason}.svg"
+        snapshot_path.write_text(svg, encoding="utf-8")
 
     def _metrics_snapshot(self, **batch_values: int | float) -> dict[str, int | float]:
         payload = self._summary_payload()
@@ -542,7 +655,11 @@ class GSM8KDynamicMCDataset(RLHFDataset):
             "[GSM8KDynamicMCDataset] "
             f"epoch_end={epoch} pending_stage2={len(self._pending_stage2_records)}"
         )
-        return self._flush_pending_stage2_records(epoch=epoch)
+        inserted = self._flush_pending_stage2_records(epoch=epoch)
+        self._record_coverage_history(event="epoch_end", epoch=epoch)
+        if self.coverage_chart_on_epoch:
+            self._write_coverage_chart(reason=f"epoch_{epoch:04d}", epoch=epoch)
+        return inserted
 
     def on_batch_end(self, batch: DataProto) -> dict[str, int | float]:
         self._hook_calls += 1
@@ -611,6 +728,9 @@ class GSM8KDynamicMCDataset(RLHFDataset):
         )
         self._queue_stage2_records(new_records)
         self._write_summary()
+        self._record_coverage_history(event="batch_end")
+        if self.coverage_chart_interval > 0 and self._hook_calls % self.coverage_chart_interval == 0:
+            self._write_coverage_chart(reason=f"step_{self._hook_calls:06d}")
         return self._metrics_snapshot(
             stage1_seen_batch=stage1_seen,
             stage1_rejected_batch=rejected,

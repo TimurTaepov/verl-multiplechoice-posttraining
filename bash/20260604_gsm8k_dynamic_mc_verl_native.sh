@@ -28,6 +28,8 @@ WANDB_ARTIFACTS=${WANDB_ARTIFACTS:-auto}
 WANDB_ARTIFACT_NAME=${WANDB_ARTIFACT_NAME:-${RUN_ID}_dynamic_mc_training_data}
 WANDB_UPLOAD_CHECKPOINTS=${WANDB_UPLOAD_CHECKPOINTS:-0}
 ARTIFACT_INCLUDE_COMPLETIONS=${ARTIFACT_INCLUDE_COMPLETIONS:-1}
+COVERAGE_CHART_INTERVAL=${COVERAGE_CHART_INTERVAL:-100}
+COVERAGE_CHART_ON_EPOCH=${COVERAGE_CHART_ON_EPOCH:-1}
 if [[ -n "${VAL_FILE:-}" ]]; then
   VAL_FILE_PROVIDED=1
 else
@@ -130,6 +132,11 @@ if ! [[ "$STAGE2_CANDIDATE_MAX_CHARS" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+if ! [[ "$COVERAGE_CHART_INTERVAL" =~ ^[0-9]+$ ]]; then
+  echo "[dynamic-mc-verl-native] COVERAGE_CHART_INTERVAL must be a non-negative integer." >&2
+  exit 1
+fi
+
 INITIAL_STAGE1_ROWS=$((NUM_SAMPLES * STAGE1_PROMPT_COUNT))
 if [[ "$INITIAL_STAGE1_ROWS" -lt "$GEN_BATCH_SIZE" ]]; then
   echo "[dynamic-mc-verl-native] Initial Stage 1 seed rows ($INITIAL_STAGE1_ROWS) must be >= GEN_BATCH_SIZE ($GEN_BATCH_SIZE)." >&2
@@ -165,6 +172,7 @@ echo "[dynamic-mc-verl-native] seed_file=$SEED_FILE"
 echo "[dynamic-mc-verl-native] val_file=$VAL_FILE"
 echo "[dynamic-mc-verl-native] checkpoint_dir=$CHECKPOINT_DIR"
 echo "[dynamic-mc-verl-native] artifact_dir=$ARTIFACT_DIR"
+echo "[dynamic-mc-verl-native] coverage_chart_interval=$COVERAGE_CHART_INTERVAL coverage_chart_on_epoch=$COVERAGE_CHART_ON_EPOCH"
 echo "[dynamic-mc-verl-native] trainer_logger=$TRAINER_LOGGER wandb_artifacts=$WANDB_ARTIFACTS"
 echo "[dynamic-mc-verl-native] stage1_prompt_count=$STAGE1_PROMPT_COUNT rollout_n=$ROLLOUT_N stage1_attempts_per_question=$((STAGE1_PROMPT_COUNT * ROLLOUT_N)) initial_stage1_rows=$INITIAL_STAGE1_ROWS"
 echo "[dynamic-mc-verl-native] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>}"
@@ -227,6 +235,8 @@ VERL_CMD=(
   +data.dynamic_mc.stage2_insert_strategy=prepend
   +data.dynamic_mc.artifact_dir="$ARTIFACT_DIR"
   +data.dynamic_mc.artifact_include_completions="$ARTIFACT_INCLUDE_COMPLETIONS"
+  +data.dynamic_mc.coverage_chart_interval="$COVERAGE_CHART_INTERVAL"
+  +data.dynamic_mc.coverage_chart_on_epoch="$COVERAGE_CHART_ON_EPOCH"
   actor_rollout_ref.model.path="$MODEL_PATH"
   actor_rollout_ref.actor.optim.lr="$LEARNING_RATE"
   actor_rollout_ref.actor.optim.lr_warmup_steps="$LR_WARMUP_STEPS"

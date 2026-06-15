@@ -52,13 +52,24 @@ def _bare_dynamic_dataset() -> GSM8KDynamicMCDataset:
     dataset.stage2_candidate_max_chars = 2000
     dataset.stage2_insert_strategy = "prepend"
     dataset.seed = 7
+    dataset.artifact_dir = None
+    dataset.artifact_include_completions = True
+    dataset.coverage_chart_interval = 100
+    dataset.coverage_chart_on_epoch = True
     dataset._candidate_buffer = {}
     dataset._stage2_counts = {}
     dataset._hook_calls = 0
+    dataset._stage1_seen_total = 0
+    dataset._stage1_rejected_total = 0
+    dataset._stage1_duplicate_total = 0
     dataset._accepted_correct_total = 0
     dataset._accepted_incorrect_total = 0
+    dataset._stage2_queued_total = 0
     dataset._inserted_stage2_total = 0
+    dataset._stage2_question_ids = set()
+    dataset._initial_question_count = 1
     dataset._pending_stage2_records = []
+    dataset._coverage_history = []
     dataset.dataframe = datasets.Dataset.from_list(
         [
             {
