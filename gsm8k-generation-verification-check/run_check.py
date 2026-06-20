@@ -6,7 +6,8 @@ import json
 import random
 import re
 import sys
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -30,6 +31,18 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def write_progress(path: Path, payload: dict[str, Any]) -> None:
+    write_json(path, payload)
+
+
+def iter_progress(iterable: Iterable[Any], *, total: int, desc: str) -> Iterable[Any]:
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
+
+
 def batched(items: Sequence[Any], batch_size: int) -> Iterable[Sequence[Any]]:
     for start in range(0, len(items), batch_size):
         yield items[start : start + batch_size]
@@ -39,8 +52,8 @@ def build_stage1_prompt(question: str) -> str:
     return (
         "Question:\n"
         f"{question.strip()}\n\n"
-        "Answer:\n"
-        "Let's think step by step."
+        "End your response with exactly one line in this format:\n"
+        "FINAL_ANSWER:<number>"
     )
 
 
@@ -121,6 +134,19 @@ class GenerationConfig:
 class Generator:
     def generate(self, prompts: Sequence[str], cfg: GenerationConfig) -> list[str]:
         raise NotImplementedError
+
+    def generate_many(self, prompts: Sequence[str], cfg: GenerationConfig, n: int) -> list[list[str]]:
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        grouped = [[] for _ in prompts]
+        for rollout_index in range(n):
+            rollout_cfg = replace(cfg, seed=cfg.seed + rollout_index)
+            outputs = self.generate(prompts, rollout_cfg)
+            if len(outputs) != len(prompts):
+                raise RuntimeError(f"Generated {len(outputs)} outputs for {len(prompts)} prompts")
+            for prompt_index, output in enumerate(outputs):
+                grouped[prompt_index].append(output)
+        return grouped
 
 
 class TransformersGenerator(Generator):
@@ -203,18 +229,30 @@ class VLLMGenerator(Generator):
         )
 
     def generate(self, prompts: Sequence[str], cfg: GenerationConfig) -> list[str]:
+        grouped = self.generate_many(prompts, cfg, 1)
+        return [outputs[0] if outputs else "" for outputs in grouped]
+
+    def generate_many(self, prompts: Sequence[str], cfg: GenerationConfig, n: int) -> list[list[str]]:
         from vllm import SamplingParams
 
+        if n < 1:
+            raise ValueError("n must be >= 1")
         formatted = [self._format_prompt(prompt, cfg.use_chat_template) for prompt in prompts]
         sampling = SamplingParams(
-            n=1,
+            n=n,
             max_tokens=cfg.max_new_tokens,
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             seed=cfg.seed,
         )
         results = self.llm.generate(formatted, sampling)
-        return [result.outputs[0].text.strip() if result.outputs else "" for result in results]
+        grouped: list[list[str]] = []
+        for result in results:
+            outputs = [output.text.strip() for output in result.outputs]
+            if len(outputs) != n:
+                raise RuntimeError(f"vLLM generated {len(outputs)} outputs for one prompt; expected {n}")
+            grouped.append(outputs)
+        return grouped
 
 
 def make_generator(cfg: GenerationConfig) -> Generator:
@@ -394,47 +432,138 @@ def run(args: argparse.Namespace) -> None:
     write_json(output_dir / "config.json", config_payload)
 
     generator = make_generator(stage1_cfg)
+    progress_path = output_dir / "progress.json"
+    started_at = time.time()
+    monotonic_start = time.monotonic()
 
-    expanded_stage1: list[dict[str, Any]] = []
-    stage1_prompts: list[str] = []
-    for example in examples:
-        for rollout_index in range(args.n_rollouts):
-            expanded_stage1.append({**example, "rollout_index": rollout_index})
-            stage1_prompts.append(build_stage1_prompt(example["question"]))
-
-    print(f"[diagnostic] loaded_questions={len(examples)} stage1_prompts={len(stage1_prompts)}")
-    stage1_outputs = generator.generate(stage1_prompts, stage1_cfg)
+    stage1_prompts = [build_stage1_prompt(example["question"]) for example in examples]
+    stage1_total = len(examples) * args.n_rollouts
+    stage1_batches = (len(stage1_prompts) + stage1_cfg.batch_size - 1) // stage1_cfg.batch_size
+    label_counts = {"correct": 0, "incorrect": 0, "parse_error": 0}
+    print(
+        f"[diagnostic] loaded_questions={len(examples)} "
+        f"stage1_prompts={len(stage1_prompts)} stage1_candidates={stage1_total}",
+        flush=True,
+    )
     candidates: list[dict[str, Any]] = []
-    for candidate_index, (meta, output) in enumerate(zip(expanded_stage1, stage1_outputs, strict=True)):
-        label_info = label_candidate(output, meta["gold_answer"], args.parse_method)
-        record = {
-            "candidate_id": f"{meta['question_id']}:{meta['rollout_index']}",
-            "candidate_index": candidate_index,
-            **meta,
-            "stage1_prompt": stage1_prompts[candidate_index],
-            "stage1_response": output,
-            **label_info,
-        }
-        candidates.append(record)
-        append_jsonl(stage1_path, record)
+    write_progress(
+        progress_path,
+        {
+            "stage": "stage1",
+            "started_at": started_at,
+            "elapsed_sec": 0.0,
+            "stage1_completed": 0,
+            "stage1_total": stage1_total,
+            "stage2_completed": 0,
+            "stage2_total": None,
+            "output_dir": str(output_dir),
+            "stage1_path": str(stage1_path),
+            "stage2_path": str(stage2_path),
+        },
+    )
 
-    print(f"[diagnostic] stage1_done candidates={len(candidates)}")
-    stage2_prompts = [build_stage2_prompt(row["question"], row["stage1_response"]) for row in candidates]
-    stage2_outputs = generator.generate(stage2_prompts, stage2_cfg)
+    for batch_start in iter_progress(range(0, len(stage1_prompts), stage1_cfg.batch_size), total=stage1_batches, desc="stage1"):
+        batch_end = min(batch_start + stage1_cfg.batch_size, len(stage1_prompts))
+        batch_prompts = stage1_prompts[batch_start:batch_end]
+        batch_examples = examples[batch_start:batch_end]
+        batch_outputs = generator.generate_many(batch_prompts, stage1_cfg, args.n_rollouts)
+        if len(batch_outputs) != len(batch_examples):
+            raise RuntimeError(f"Stage 1 generated output groups for {len(batch_outputs)} prompts; expected {len(batch_examples)}")
+        for example, prompt, rollout_outputs in zip(batch_examples, batch_prompts, batch_outputs, strict=True):
+            if len(rollout_outputs) != args.n_rollouts:
+                raise RuntimeError(f"Stage 1 generated {len(rollout_outputs)} rollouts; expected {args.n_rollouts}")
+            for rollout_index, output in enumerate(rollout_outputs):
+                candidate_index = len(candidates)
+                label_info = label_candidate(output, example["gold_answer"], args.parse_method)
+                label_counts[label_info["rule_label"]] += 1
+                record = {
+                    "candidate_id": f"{example['question_id']}:{rollout_index}",
+                    "candidate_index": candidate_index,
+                    **example,
+                    "rollout_index": rollout_index,
+                    "stage1_prompt": prompt,
+                    "stage1_response": output,
+                    **label_info,
+                }
+                candidates.append(record)
+                append_jsonl(stage1_path, record)
+        elapsed = time.monotonic() - monotonic_start
+        write_progress(
+            progress_path,
+            {
+                "stage": "stage1",
+                "started_at": started_at,
+                "elapsed_sec": elapsed,
+                "stage1_completed": len(candidates),
+                "stage1_total": stage1_total,
+                "stage1_label_counts": label_counts,
+                "stage2_completed": 0,
+                "stage2_total": None,
+                "output_dir": str(output_dir),
+                "stage1_path": str(stage1_path),
+                "stage2_path": str(stage2_path),
+            },
+        )
+        print(
+            f"[progress] stage1 {len(candidates)}/{stage1_total} "
+            f"correct={label_counts['correct']} incorrect={label_counts['incorrect']} "
+            f"parse_error={label_counts['parse_error']} elapsed_sec={elapsed:.1f}",
+            flush=True,
+        )
 
+    print(f"[diagnostic] stage1_done candidates={len(candidates)}", flush=True)
+    stage2_total = len(candidates)
+    stage2_batches = (stage2_total + stage2_cfg.batch_size - 1) // stage2_cfg.batch_size
     final_records: list[dict[str, Any]] = []
-    for row, prompt, output in zip(candidates, stage2_prompts, stage2_outputs, strict=True):
-        verifier_verdict = parse_verdict(output)
-        verification_correct = verifier_verdict == row["target_verdict"]
-        record = {
-            **row,
-            "stage2_prompt": prompt,
-            "stage2_response": output,
-            "verifier_verdict": verifier_verdict,
-            "verification_correct": verification_correct,
-        }
-        final_records.append(record)
-        append_jsonl(stage2_path, record)
+    verdict_counts = {"correct": 0, "incorrect": 0, "unknown": 0}
+    verification_correct_count = 0
+    for batch_start in iter_progress(range(0, stage2_total, stage2_cfg.batch_size), total=stage2_batches, desc="stage2"):
+        batch_end = min(batch_start + stage2_cfg.batch_size, stage2_total)
+        batch_rows = candidates[batch_start:batch_end]
+        batch_prompts = [build_stage2_prompt(row["question"], row["stage1_response"]) for row in batch_rows]
+        batch_outputs = generator.generate(batch_prompts, stage2_cfg)
+        if len(batch_outputs) != len(batch_rows):
+            raise RuntimeError(f"Stage 2 generated {len(batch_outputs)} outputs for {len(batch_rows)} prompts")
+        for row, prompt, output in zip(batch_rows, batch_prompts, batch_outputs, strict=True):
+            verifier_verdict = parse_verdict(output)
+            verdict_counts[verifier_verdict] += 1
+            verification_correct = verifier_verdict == row["target_verdict"]
+            verification_correct_count += int(verification_correct)
+            record = {
+                **row,
+                "stage2_prompt": prompt,
+                "stage2_response": output,
+                "verifier_verdict": verifier_verdict,
+                "verification_correct": verification_correct,
+            }
+            final_records.append(record)
+            append_jsonl(stage2_path, record)
+        elapsed = time.monotonic() - monotonic_start
+        write_progress(
+            progress_path,
+            {
+                "stage": "stage2",
+                "started_at": started_at,
+                "elapsed_sec": elapsed,
+                "stage1_completed": stage1_total,
+                "stage1_total": stage1_total,
+                "stage1_label_counts": label_counts,
+                "stage2_completed": len(final_records),
+                "stage2_total": stage2_total,
+                "stage2_verdict_counts": verdict_counts,
+                "stage2_verification_correct_count": verification_correct_count,
+                "output_dir": str(output_dir),
+                "stage1_path": str(stage1_path),
+                "stage2_path": str(stage2_path),
+            },
+        )
+        print(
+            f"[progress] stage2 {len(final_records)}/{stage2_total} "
+            f"verdict_correct={verdict_counts['correct']} verdict_incorrect={verdict_counts['incorrect']} "
+            f"unknown={verdict_counts['unknown']} verification_correct={verification_correct_count} "
+            f"elapsed_sec={elapsed:.1f}",
+            flush=True,
+        )
 
     metrics = compute_metrics(final_records)
     metrics["num_questions"] = len(examples)
@@ -493,4 +622,3 @@ if __name__ == "__main__":
         run(parse_args())
     except KeyboardInterrupt:
         sys.exit(130)
-

@@ -38,8 +38,16 @@ def test_flexible_parser_extracts_final_answer_marker():
     assert gsm8k.compute_score(completion, "15", method="flexible") == 1.0
 
 
+def test_flexible_parser_prefers_final_answer_marker_over_later_context_number():
+    completion = (
+        "Weng babysat for 50 minutes. She earns $12 per hour, so she earned $10.\n"
+        "FINAL_ANSWER:10"
+    )
+    assert gsm8k.extract_solution(completion, method="flexible") == "10"
+    assert gsm8k.compute_score(completion, "10", method="flexible") == 1.0
+
+
 def test_strict_parser_does_not_accept_final_answer_marker():
     completion = "REASONING: compute carefully\nFINAL_ANSWER: 15"
     assert gsm8k.extract_solution(completion, method="strict") is None
     assert gsm8k.compute_score(completion, "15", method="strict") == 0
-
