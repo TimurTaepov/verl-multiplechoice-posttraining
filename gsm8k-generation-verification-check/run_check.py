@@ -63,25 +63,21 @@ def build_stage2_prompt(question: str, proposed_solution: str) -> str:
         f"{question.strip()}\n\n"
         "Proposed solution:\n"
         f"{proposed_solution.strip()}\n\n"
-        "Is this answer correct?\n"
-        "Answer with exactly one word first: correct or incorrect."
+        "Is this answer correct? \n"
+        "Justify your answer and reason step by step.\n"
+        "End with exactly one final line in one of these formats:\n"
+        "VERDICT: correct\n"
+        "VERDICT: incorrect"
     )
 
 
 def parse_verdict(text: str) -> str:
-    head = text.strip().lower()[:500]
-    if not head:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
         return "unknown"
-    if re.search(r"\b(incorrect|wrong|false)\b", head):
-        return "incorrect"
-    if re.search(r"\bnot\s+(?:mathematically\s+)?correct\b", head):
-        return "incorrect"
-    if re.match(r"^\s*(no|nope)\b", head):
-        return "incorrect"
-    if re.search(r"\b(correct|right|true)\b", head):
-        return "correct"
-    if re.match(r"^\s*(yes|yeah|yep)\b", head):
-        return "correct"
+    match = re.fullmatch(r"\s*VERDICT:\s*(correct|incorrect)\s*", lines[-1], flags=re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
     return "unknown"
 
 
@@ -324,7 +320,7 @@ def compute_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
     balanced = None
     if correct_acc is not None and incorrect_acc is not None:
         balanced = (correct_acc + incorrect_acc) / 2.0
-    return {
+    metrics = {
         "total_candidates": total,
         "generation_correct_count": correct,
         "generation_incorrect_or_parse_error_count": incorrect,
@@ -343,6 +339,54 @@ def compute_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
             else balanced - safe_div(correct, total)
         ),
     }
+
+    records_by_question: dict[str, list[dict[str, Any]]] = {}
+    for row in records:
+        records_by_question.setdefault(str(row["question_id"]), []).append(row)
+
+    def add_question_subset_metrics(name: str, selected_groups: list[list[dict[str, Any]]]) -> None:
+        selected_records = [row for rows in selected_groups for row in rows]
+        selected_correct = [row for row in selected_records if row["rule_label"] == "correct"]
+        selected_incorrect = [
+            row for row in selected_records if row["rule_label"] in {"incorrect", "parse_error"}
+        ]
+        selected_correct_acc = safe_div(
+            sum(1 for row in selected_correct if row["verifier_verdict"] == "correct"),
+            len(selected_correct),
+        )
+        selected_incorrect_acc = safe_div(
+            sum(1 for row in selected_incorrect if row["verifier_verdict"] == "incorrect"),
+            len(selected_incorrect),
+        )
+        selected_balanced = None
+        if selected_correct_acc is not None and selected_incorrect_acc is not None:
+            selected_balanced = (selected_correct_acc + selected_incorrect_acc) / 2.0
+        metrics.update(
+            {
+                f"questions_{name}": len(selected_groups),
+                f"candidates_{name}": len(selected_records),
+                f"verification_accuracy_{name}": safe_div(
+                    sum(1 for row in selected_records if row["verification_correct"]),
+                    len(selected_records),
+                ),
+                f"verification_accept_rate_on_correct_candidates_{name}": selected_correct_acc,
+                f"verification_reject_rate_on_incorrect_candidates_{name}": selected_incorrect_acc,
+                f"balanced_verification_accuracy_{name}": selected_balanced,
+            }
+        )
+
+    groups_with_at_least_one_correct = [
+        rows for rows in records_by_question.values() if any(row["rule_label"] == "correct" for row in rows)
+    ]
+    groups_with_mixed_correctness = [
+        rows
+        for rows in groups_with_at_least_one_correct
+        if any(row["rule_label"] in {"incorrect", "parse_error"} for row in rows)
+    ]
+    add_question_subset_metrics("with_at_least_one_correct_rollout", groups_with_at_least_one_correct)
+    add_question_subset_metrics("with_mixed_correctness_rollouts", groups_with_mixed_correctness)
+
+    return metrics
 
 
 
